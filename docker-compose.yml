@@ -1,0 +1,216 @@
+version: '3.9'
+
+services:
+
+  # ─── DATABASE ─────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: voc-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-vocdb}
+      POSTGRES_USER: ${POSTGRES_USER:-vocuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-vocpass}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - voc-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vocuser -d vocdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── REDIS (broker Celery) ─────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: voc-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    networks:
+      - voc-net
+
+  # ─── BACKEND API (FastAPI) ────────────────────────────────
+  backend:
+    build:
+      context: ./services/backend
+      dockerfile: Dockerfile
+    container_name: voc-backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-vocuser}:${POSTGRES_PASSWORD:-vocpass}@postgres:5432/${POSTGRES_DB:-vocdb}
+      REDIS_URL: redis://redis:6379/0
+      NVD_API_KEY: ${NVD_API_KEY:-}
+      SECRET_KEY: ${SECRET_KEY:-changeme_in_production}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+    volumes:
+      - ./services/backend:/app
+      - scan_results:/app/scan_results
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - voc-net
+
+  # ─── CELERY WORKER (tâches asynchrones) ──────────────────
+  celery-worker:
+    build:
+      context: ./services/backend
+      dockerfile: Dockerfile
+    container_name: voc-celery-worker
+    restart: unless-stopped
+    command: celery -A app.celery_app worker --loglevel=info --concurrency=4
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-vocuser}:${POSTGRES_PASSWORD:-vocpass}@postgres:5432/${POSTGRES_DB:-vocdb}
+      REDIS_URL: redis://redis:6379/0
+      NVD_API_KEY: ${NVD_API_KEY:-}
+    volumes:
+      - ./services/backend:/app
+      - scan_results:/app/scan_results
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - voc-net
+
+  # ─── CELERY BEAT (scheduler) ──────────────────────────────
+  celery-beat:
+    build:
+      context: ./services/backend
+      dockerfile: Dockerfile
+    container_name: voc-celery-beat
+    restart: unless-stopped
+    command: celery -A app.celery_app beat --loglevel=info
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-vocuser}:${POSTGRES_PASSWORD:-vocpass}@postgres:5432/${POSTGRES_DB:-vocdb}
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./services/backend:/app
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - voc-net
+
+  # ─── SCANNER SERVICE ──────────────────────────────────────
+  scanner:
+    build:
+      context: ./services/scanner
+      dockerfile: Dockerfile
+    container_name: voc-scanner
+    restart: unless-stopped
+    environment:
+      BACKEND_URL: http://backend:8000
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./services/scanner:/app
+      - scan_results:/app/scan_results
+    depends_on:
+      - backend
+      - redis
+    networks:
+      - voc-net
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+
+  # ─── ENRICHMENT SERVICE ───────────────────────────────────
+  enrichment:
+    build:
+      context: ./services/enrichment
+      dockerfile: Dockerfile
+    container_name: voc-enrichment
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-vocuser}:${POSTGRES_PASSWORD:-vocpass}@postgres:5432/${POSTGRES_DB:-vocdb}
+      REDIS_URL: redis://redis:6379/0
+      NVD_API_KEY: ${NVD_API_KEY:-}
+      GREYNOISE_API_KEY: ${GREYNOISE_API_KEY:-}
+    volumes:
+      - ./services/enrichment:/app
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - voc-net
+
+  # ─── FRONTEND ─────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./services/frontend
+      dockerfile: Dockerfile
+    container_name: voc-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      REACT_APP_API_URL: http://localhost:8000
+    networks:
+      - voc-net
+
+  # ─── NGINX Reverse Proxy ──────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: voc-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - voc-net
+
+  # ─── GRAFANA Dashboards ───────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: voc-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./dashboards:/etc/grafana/provisioning/dashboards
+    ports:
+      - "3001:3000"
+    depends_on:
+      - postgres
+    networks:
+      - voc-net
+
+  # ─── FLOWER (monitoring Celery) ───────────────────────────
+  flower:
+    build:
+      context: ./services/backend
+      dockerfile: Dockerfile
+    container_name: voc-flower
+    restart: unless-stopped
+    command: celery -A app.celery_app flower --port=5555
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+    networks:
+      - voc-net
+
+volumes:
+  pgdata:
+  grafana_data:
+  scan_results:
+
+networks:
+  voc-net:
+    driver: bridge
